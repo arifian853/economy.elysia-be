@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
 const migration = readFileSync(
-  new URL("../../supabase/migrations/004_budget_channels.sql", import.meta.url),
+  new URL("../migrations/004_budget_channels.sql", import.meta.url),
   "utf8",
 );
 

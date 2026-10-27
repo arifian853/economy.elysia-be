@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
-const migration = readFileSync(new URL("../../supabase/migrations/006_delete_completed_events.sql", import.meta.url), "utf8");
+const migration = readFileSync(new URL("../migrations/006_delete_completed_events.sql", import.meta.url), "utf8");
 
 describe("completed-event deletion migration", () => {
   test("permits parent event deletion while preserving completed-row updates as immutable", () => {

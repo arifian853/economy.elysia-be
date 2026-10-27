@@ -5,16 +5,20 @@ import { createEconomyAssistantApi } from "./assistant-api";
 import { eventRoutes } from "./routes/events";
 import { publicEventRoutes } from "./routes/public-events";
 import { transactionRoutes } from "./routes/transactions";
+import { evidenceRoutes } from "./routes/evidence";
+import { fxRoutes } from "./routes/fx";
 
 const port = Number(process.env.PORT ?? 3001);
 
 export const app = new Elysia({ prefix: "/api" })
   .get("/health", () => ({ status: "ok" }))
   .use(publicEventRoutes)
+  .use(fxRoutes)
   .use(auth)
   .get("/me", ({ user }) => ({ id: user.id, email: user.email }))
   .use(eventRoutes)
-  .use(transactionRoutes);
+  .use(transactionRoutes)
+  .use(evidenceRoutes);
 
 if (import.meta.main) {
   app.listen({ port, hostname: "127.0.0.1" });

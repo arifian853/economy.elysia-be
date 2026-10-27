@@ -3,6 +3,8 @@ import { Elysia } from "elysia";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { createEventRoutes } from "./routes/events";
 import { createTransactionRoutes } from "./routes/transactions";
+import { createEvidenceRoutes } from "./routes/evidence";
+import { fxService, type FxService } from "./fx";
 
 function secureTokenMatch(header: string | null, expectedToken: string): boolean {
   if (!header?.startsWith("Bearer ")) return false;
@@ -15,10 +17,12 @@ export function createEconomyAssistantApi({
   token,
   ownerId,
   db,
+  fx = fxService,
 }: {
   token: string;
   ownerId: string;
   db: SupabaseClient;
+  fx?: FxService;
 }) {
   const ownerAuth = new Elysia({ name: "economy-assistant-owner-auth" }).resolve(
     { as: "scoped" },
@@ -32,6 +36,7 @@ export function createEconomyAssistantApi({
       return { error: "Unauthorized" };
     })
     .get("/health", () => ({ status: "ok" }))
-    .use(createEventRoutes(ownerAuth as never))
-    .use(createTransactionRoutes(ownerAuth as never));
+    .use(createEventRoutes(ownerAuth as never, fx))
+    .use(createTransactionRoutes(ownerAuth as never, fx))
+    .use(createEvidenceRoutes(ownerAuth as never));
 }

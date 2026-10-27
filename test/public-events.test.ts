@@ -44,7 +44,7 @@ describe("public event route", () => {
     expect(response.status).toBe(200);
     expect(receivedToken).toBe(SHARE_TOKEN);
     expect(await response.json()).toEqual({
-      event: { name: "Camping Bintan", eventDate: "2026-11-03" },
+      event: { name: "Camping Bintan", eventDate: "2026-11-03", initialBudget: 100_000, initialBudgetKnown: false },
       budgetSummary: {
         budget: 100_000,
         cashBudget: 25_000,

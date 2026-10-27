@@ -1,14 +1,20 @@
 import { Elysia, t } from "elysia";
 import { auth } from "../auth";
 import { ARCHIVED_EVENT_MUTATION_ERROR, getArchiveConflict } from "../event-archive";
+import { fxService, type FxService } from "../fx";
+import { MoneyInput, canonical, idrEquivalent, moneyJson, multiply, normalizeMoney, TRANSACTION_SELECT, type Money } from "../money";
 
 export type TransactionRow = {
   id: string;
   event_id: string;
-  user_id: string;
+  user_id?: string;
   name: string;
   quantity: number;
-  unit_price: number;
+  unit_price: Money;
+  base_currency?: string;
+  fx_rate_to_idr?: Money | null;
+  fx_rate_date?: string | null;
+  fx_rate_provider?: string | null;
   payment_method: "cash" | "transfer" | "qris" | "ewallet" | "other";
   note: string | null;
   transaction_at: string;
@@ -21,8 +27,13 @@ export const toTransaction = (r: TransactionRow) => ({
   eventId: r.event_id,
   name: r.name,
   quantity: r.quantity,
-  unitPrice: Number(r.unit_price),
-  total: r.quantity * Number(r.unit_price),
+  baseCurrency: r.base_currency ?? "IDR",
+  unitPrice: moneyJson(r.unit_price),
+  total: moneyJson(multiply(r.quantity, r.unit_price)),
+  fxRateToIdr: r.fx_rate_to_idr == null ? null : canonical(r.fx_rate_to_idr),
+  fxRateDate: r.fx_rate_date ?? null,
+  fxRateProvider: r.fx_rate_provider ?? null,
+  idrEquivalent: idrEquivalent(multiply(r.quantity, r.unit_price), r.fx_rate_to_idr ?? null),
   paymentMethod: r.payment_method,
   note: r.note,
   transactionAt: r.transaction_at,
@@ -39,8 +50,8 @@ const PaymentMethod = t.Union([
 ]);
 
 const TransactionName = t.String({ minLength: 1, maxLength: 200, pattern: "\\S" });
-const Quantity = t.Integer({ minimum: 1 });
-const UnitPrice = t.Integer({ minimum: 0 });
+const Quantity = t.Integer({ minimum: 1, maximum: 2147483647 });
+const UnitPrice = MoneyInput;
 const Note = t.Union([t.String({ maxLength: 2000 }), t.Null()]);
 const TransactionAt = t.Optional(t.String());
 
@@ -50,7 +61,7 @@ const IdParam = t.Object({ id: t.String({ format: "uuid" }) });
 const isClientError = (code?: string) => !!code && (code.startsWith("22") || code.startsWith("23"));
 const isArchiveDbError = (error?: { code?: string }) => error?.code === "55000";
 
-export function createTransactionRoutes(authPlugin: typeof auth = auth) {
+export function createTransactionRoutes(authPlugin: typeof auth = auth, fx: FxService = fxService) {
   return new Elysia()
   .use(authPlugin)
   // POST /api/events/:eventId/transactions - Tambah transaksi ke event
@@ -60,7 +71,7 @@ export function createTransactionRoutes(authPlugin: typeof auth = auth) {
       // 1. Verifikasi kepemilikan event terlebih dahulu
       const { data: event, error: eventErr } = await db
         .from("events")
-        .select("id, status")
+        .select("id, status, base_currency")
         .eq("id", params.eventId)
         .eq("user_id", user.id)
         .maybeSingle();
@@ -70,6 +81,14 @@ export function createTransactionRoutes(authPlugin: typeof auth = auth) {
       const archiveConflict = getArchiveConflict(event.status);
       if (archiveConflict) return status(409, { error: archiveConflict });
 
+      const currency = event.base_currency ?? "IDR";
+      if ((body.currency !== undefined && body.currency !== currency) || (body.baseCurrency !== undefined && body.baseCurrency !== currency)) {
+        return status(400, { error: "Nominal harus menggunakan mata uang dasar event." });
+      }
+      let unitPrice: string;
+      try { unitPrice = normalizeMoney(body.unitPrice, currency); }
+      catch (error) { return status(400, { error: (error as Error).message }); }
+      const rate = await fx.snapshot(currency);
       // 2. Buat transaksi
       const { data, error } = await db
         .from("transactions")
@@ -78,12 +97,16 @@ export function createTransactionRoutes(authPlugin: typeof auth = auth) {
           user_id: user.id,
           name: body.name.trim(),
           quantity: body.quantity ?? 1,
-          unit_price: body.unitPrice,
+          unit_price: unitPrice,
+          base_currency: currency,
+          fx_rate_to_idr: rate?.rate ?? null,
+          fx_rate_date: rate?.date ?? null,
+          fx_rate_provider: rate?.provider ?? null,
           payment_method: body.paymentMethod,
           note: body.note ?? null,
           transaction_at: body.transactionAt ?? new Date().toISOString(),
         })
-        .select()
+        .select(TRANSACTION_SELECT)
         .single();
 
       if (error) {
@@ -99,6 +122,8 @@ export function createTransactionRoutes(authPlugin: typeof auth = auth) {
         name: TransactionName,
         quantity: t.Optional(Quantity),
         unitPrice: UnitPrice,
+        currency: t.Optional(t.String({ pattern: "^[A-Z]{3}$" })),
+        baseCurrency: t.Optional(t.String({ pattern: "^[A-Z]{3}$" })),
         paymentMethod: PaymentMethod,
         note: t.Optional(Note),
         transactionAt: TransactionAt,
@@ -132,7 +157,7 @@ export function createTransactionRoutes(authPlugin: typeof auth = auth) {
 
       const { data: event, error: eventError } = await db
         .from("events")
-        .select("status")
+        .select("status, base_currency")
         .eq("id", transaction.event_id)
         .eq("user_id", user.id)
         .maybeSingle();
@@ -141,6 +166,14 @@ export function createTransactionRoutes(authPlugin: typeof auth = auth) {
       const archiveConflict = getArchiveConflict(event.status);
       if (archiveConflict) return status(409, { error: archiveConflict });
 
+      const currency = event.base_currency ?? "IDR";
+      if ((body.currency !== undefined && body.currency !== currency) || (body.baseCurrency !== undefined && body.baseCurrency !== currency)) {
+        return status(400, { error: "Nominal harus menggunakan mata uang dasar event." });
+      }
+      if (body.unitPrice !== undefined) {
+        try { patch.unit_price = normalizeMoney(body.unitPrice, currency); }
+        catch (error) { return status(400, { error: (error as Error).message }); }
+      }
       patch.updated_at = new Date().toISOString();
 
       const { data, error } = await db
@@ -148,7 +181,7 @@ export function createTransactionRoutes(authPlugin: typeof auth = auth) {
         .update(patch)
         .eq("id", params.id)
         .eq("user_id", user.id)
-        .select()
+        .select(TRANSACTION_SELECT)
         .maybeSingle();
 
       if (error) {
@@ -166,6 +199,8 @@ export function createTransactionRoutes(authPlugin: typeof auth = auth) {
         name: t.Optional(TransactionName),
         quantity: t.Optional(Quantity),
         unitPrice: t.Optional(UnitPrice),
+        currency: t.Optional(t.String({ pattern: "^[A-Z]{3}$" })),
+        baseCurrency: t.Optional(t.String({ pattern: "^[A-Z]{3}$" })),
         paymentMethod: t.Optional(PaymentMethod),
         note: t.Optional(Note),
         transactionAt: TransactionAt,

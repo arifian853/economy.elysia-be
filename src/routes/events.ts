@@ -1,15 +1,20 @@
 import { Elysia, t } from "elysia";
 import { auth } from "../auth";
-import { ensureShareCode, type ShareCodeStore } from "../share-code";
-import { resolveCashBudgetUpdate } from "../budget-allocation";
+import { ensureShareToken, type ShareTokenStore } from "../share-token";
 import { ARCHIVED_EVENT_MUTATION_ERROR, getArchiveConflict } from "../event-archive";
+import { fxService, type FxService } from "../fx";
+import { currencyFields, referencePatch, refreshEventReference, validateCurrency, type CurrencyRow } from "../event-currency";
+import { add, canonical, compare, EVENT_SELECT, moneyJson, MoneyInput, multiply, normalizeMoney, subtract, TRANSACTION_SELECT, type Money } from "../money";
+import { toTransaction, type TransactionRow } from "./transactions";
 
-type EventRow = {
+type EventRow = CurrencyRow & {
   id: string;
   name: string;
   event_date: string;
-  budget: number;
-  cash_budget: number | null;
+  budget: Money;
+  initial_budget: Money;
+  initial_budget_known: boolean;
+  cash_budget: Money | null;
   status: "upcoming" | "active" | "completed";
   notes: string | null;
   created_at: string;
@@ -17,24 +22,16 @@ type EventRow = {
   completed_at: string | null;
 };
 
-type TransactionRow = {
-  id: string;
-  event_id: string;
-  name: string;
-  quantity: number;
-  unit_price: number;
-  payment_method: string;
-  note: string | null;
-  transaction_at: string;
-};
-
 const toEvent = (r: EventRow) => ({
   id: r.id,
   name: r.name,
   eventDate: r.event_date,
-  budget: Number(r.budget),
-  cashBudget: r.cash_budget === null ? null : Number(r.cash_budget),
-  digitalBudget: r.cash_budget === null ? null : Number(r.budget) - Number(r.cash_budget),
+  budget: moneyJson(r.budget),
+  initialBudget: moneyJson(r.initial_budget),
+  initialBudgetKnown: r.initial_budget_known,
+  cashBudget: r.cash_budget === null ? null : moneyJson(r.cash_budget),
+  digitalBudget: r.cash_budget === null ? null : moneyJson(subtract(r.budget, r.cash_budget)),
+  ...currencyFields(r),
   status: r.status,
   notes: r.notes,
   createdAt: r.created_at,
@@ -42,66 +39,150 @@ const toEvent = (r: EventRow) => ({
   completedAt: r.completed_at,
 });
 
-const toTransaction = (r: TransactionRow) => ({
-  id: r.id,
-  eventId: r.event_id,
-  name: r.name,
-  quantity: r.quantity,
-  unitPrice: Number(r.unit_price),
-  total: r.quantity * Number(r.unit_price),
-  paymentMethod: r.payment_method,
-  note: r.note,
-  transactionAt: r.transaction_at,
-});
-
 const ParticipantName = t.String({ minLength: 1, maxLength: 100, pattern: "\\S" });
 const EditableStatus = t.Union([t.Literal("upcoming"), t.Literal("active")]);
 const Name = t.String({ minLength: 1, maxLength: 200, pattern: "\\S" }); // tidak boleh kosong/spasi saja
 const EventDate = t.String({ pattern: "^\\d{4}-\\d{2}-\\d{2}$" });
-const Budget = t.Integer({ minimum: 1 });
+const Budget = MoneyInput;
+const CurrencyMode = t.Union([t.Literal("domestic"), t.Literal("international")]);
+const Currency = t.String({ pattern: "^[A-Z]{3}$" });
 const Notes = t.Union([t.String({ maxLength: 2000 }), t.Null()]);
 const EventId = t.Object({ eventId: t.String({ format: "uuid" }) });
 
 // Error Postgres kelas 22xxx/23xxx (nilai/constraint tidak valid) = salah input, bukan error server.
 const isClientError = (code?: string) => !!code && (code.startsWith("22") || code.startsWith("23"));
 const isArchiveDbError = (error?: { code?: string }) => error?.code === "55000";
+const rpcMoneyFields = new Set(["amount", "budget", "cashBudget", "digitalBudget", "budgetDelta", "cashBudgetDelta"]);
+const rpcMoney = (data: Record<string, unknown> | null) => data === null ? null : Object.fromEntries(
+  Object.entries(data).map(([key, value]) => [key,
+    rpcMoneyFields.has(key) && (typeof value === "string" || typeof value === "number") ? moneyJson(value) : value]),
+);
 
-export function createEventRoutes(authPlugin: typeof auth = auth) {
+export function createEventRoutes(authPlugin: typeof auth = auth, fx: FxService = fxService) {
   return new Elysia({ prefix: "/events" })
   .use(authPlugin)
+  .post(
+    "/:eventId/reallocations",
+    async ({ user, db, params, body, status }) => {
+      let amount: string;
+      try {
+        amount = canonical(body.amount);
+        if (compare(amount, "0") <= 0) throw Error("Nominal realokasi harus positif.");
+      } catch (error) { return status(400, { error: (error as Error).message }); }
+      const { data, error } = await db.rpc("reallocate_event_funds", {
+        p_event_id: params.eventId,
+        p_user_id: user.id,
+        p_from_channel: body.from,
+        p_amount: amount,
+        p_note: body.note ?? null,
+      });
+      if (error) {
+        const code = (error as { code?: string }).code;
+        const http = code === "55000" ? 409 : code === "42501" ? 403 : code === "P0002" ? 404 : code === "22023" ? 400 : 500;
+        return status(http, { error: http === 500 ? "Gagal memindahkan alokasi dana." : (error as { message?: string }).message });
+      }
+      return rpcMoney(data);
+    },
+    {
+      params: EventId,
+      body: t.Object({
+        from: t.Union([t.Literal("cash"), t.Literal("digital")]),
+        amount: MoneyInput,
+        note: t.Optional(t.String({ maxLength: 500 })),
+      }),
+    },
+  )
+  .get("/:eventId/budget-history", async ({ user, db, params, status }) => {
+    const { data: event, error: eventError } = await db.from("events").select("id")
+      .eq("id", params.eventId).eq("user_id", user.id).maybeSingle();
+    if (eventError) return status(500, { error: "Gagal membaca event." });
+    if (!event) return status(404, { error: "Event tidak ditemukan." });
+    const [moves, adjustments] = await Promise.all([
+      db.from("event_fund_movements").select("id,from_channel,amount::text,note,created_at")
+        .eq("event_id", params.eventId).eq("user_id", user.id).order("created_at", { ascending: false }),
+      db.from("event_budget_adjustments").select("id,budget_delta::text,cash_budget_delta::text,reason,created_at")
+        .eq("event_id", params.eventId).eq("user_id", user.id).order("created_at", { ascending: false }),
+    ]);
+    if (moves.error || adjustments.error) return status(500, { error: "Gagal membaca riwayat anggaran." });
+    return {
+      reallocations: (moves.data ?? []).map((r) => ({ ...r, amount: moneyJson(r.amount) })),
+      adjustments: (adjustments.data ?? []).map((r) => ({ ...r, budget_delta: moneyJson(r.budget_delta), cash_budget_delta: moneyJson(r.cash_budget_delta) })),
+    };
+  }, { params: EventId })
+  .post(
+    "/:eventId/budget-adjustments",
+    async ({ user, db, params, body, status }) => {
+      let budgetDelta: string, cashBudgetDelta: string;
+      try { budgetDelta = canonical(body.budgetDelta); cashBudgetDelta = canonical(body.cashBudgetDelta); }
+      catch (error) { return status(400, { error: (error as Error).message }); }
+      const { data, error } = await db.rpc("adjust_event_budget", {
+        p_event_id: params.eventId,
+        p_user_id: user.id,
+        p_budget_delta: budgetDelta,
+        p_cash_budget_delta: cashBudgetDelta,
+        p_reason: body.reason,
+      });
+      if (error) {
+        const code = (error as { code?: string }).code;
+        const http = code === "55000" ? 409 : code === "42501" ? 403 : code === "P0002" ? 404 : code === "22023" ? 400 : 500;
+        return status(http, { error: http === 500 ? "Gagal menyesuaikan anggaran." : (error as { message?: string }).message });
+      }
+      return rpcMoney(data);
+    },
+    {
+      params: EventId,
+      body: t.Object({
+        budgetDelta: MoneyInput,
+        cashBudgetDelta: MoneyInput,
+        reason: t.String({ minLength: 1, maxLength: 500, pattern: "\\S" }),
+      }),
+    },
+  )
   .get("/", async ({ user, db, status }) => {
     const { data, error } = await db
       .from("events")
-      .select("*, transactions(quantity, unit_price), participants(id)")
+      .select(`${EVENT_SELECT}, transactions(quantity, unit_price::text), participants(id)`)
       .eq("user_id", user.id)
       .order("event_date", { ascending: false })
       .order("created_at", { ascending: false });
     if (error) return status(500, { error: error.message });
 
     type ListRow = EventRow & {
-      transactions: { quantity: number; unit_price: number }[];
+      transactions: { quantity: number; unit_price: Money }[];
       participants: { id: string }[];
     };
-    return (data as ListRow[]).map(({ transactions, participants, ...event }) => ({
+    return (data as unknown as ListRow[]).map(({ transactions, participants, ...event }) => ({
       ...toEvent(event),
-      totalExpenses: transactions.reduce((sum, x) => sum + x.quantity * x.unit_price, 0),
+      totalExpenses: moneyJson(transactions.reduce((sum, x) => add(sum, multiply(x.quantity, x.unit_price)), "0")),
       participantCount: participants.length,
     }));
   })
   .post(
     "/",
     async ({ user, db, body, status }) => {
+      const mode = body.currencyMode ?? "domestic", currency = body.baseCurrency ?? "IDR";
+      let budget: string;
+      try {
+        await validateCurrency(mode, currency, fx);
+        budget = normalizeMoney(body.budget, currency, { positive: true });
+      } catch (error) { return status(400, { error: (error as Error).message }); }
+      const rate = await fx.snapshot(currency);
       const { data, error } = await db
         .from("events")
         .insert({
           user_id: user.id,
           name: body.name.trim(),
           event_date: body.eventDate,
-          budget: body.budget,
+          budget,
+          initial_budget: budget,
+          initial_budget_known: true,
+          currency_mode: mode,
+          base_currency: currency,
+          ...referencePatch(rate),
           status: body.status ?? "upcoming",
           notes: body.notes ?? null,
         })
-        .select()
+        .select(EVENT_SELECT)
         .single();
       if (error) return status(isClientError(error.code) ? 400 : 500, { error: error.message });
 
@@ -119,13 +200,15 @@ export function createEventRoutes(authPlugin: typeof auth = auth) {
         }
       }
 
-      return status(201, toEvent(data as EventRow));
+      return status(201, toEvent(data as unknown as EventRow));
     },
     {
       body: t.Object({
         name: Name,
         eventDate: EventDate,
         budget: Budget,
+        currencyMode: t.Optional(CurrencyMode),
+        baseCurrency: t.Optional(Currency),
         status: t.Optional(EditableStatus),
         notes: t.Optional(Notes),
         participants: t.Optional(t.Array(ParticipantName)),
@@ -154,15 +237,15 @@ export function createEventRoutes(authPlugin: typeof auth = auth) {
         .eq("id", params.eventId)
         .eq("user_id", user.id)
         .in("status", ["upcoming", "active"])
-        .select()
+        .select(EVENT_SELECT)
         .maybeSingle();
       if (error) {
         return status(isArchiveDbError(error) ? 409 : 500, {
-          error: isArchiveDbError(error) ? ARCHIVED_EVENT_MUTATION_ERROR : error.message,
+          error: isArchiveDbError(error) ? (error.message === "Event currency is locked." ? "Mata uang terkunci setelah transaksi pertama." : ARCHIVED_EVENT_MUTATION_ERROR) : error.message,
         });
       }
       if (!data) return status(409, { error: ARCHIVED_EVENT_MUTATION_ERROR });
-      return toEvent(data as EventRow);
+      return toEvent(data as unknown as EventRow);
     },
     { params: EventId },
   )
@@ -170,76 +253,48 @@ export function createEventRoutes(authPlugin: typeof auth = auth) {
     "/:eventId/public-link",
     async ({ user, db, params, status }) => {
       const { data: existing, error: lookupError } = await db.from("events")
-        .select("public_share_token, public_share_code")
+        .select("public_share_token")
         .eq("id", params.eventId).eq("user_id", user.id).maybeSingle();
       if (lookupError) return status(500, { error: "Gagal membaca status tautan publik." });
       if (!existing) return status(404, { error: "Event tidak ditemukan." });
-      if (!existing.public_share_token && !existing.public_share_code) return { enabled: false, token: null };
-      if (existing.public_share_code) return { enabled: true, token: existing.public_share_code };
-
-      const store: ShareCodeStore = {
-        read: async () => {
-          const { data, error } = await db.from("events")
-            .select("public_share_token, public_share_code")
-            .eq("id", params.eventId).eq("user_id", user.id).maybeSingle();
-          if (error) throw error;
-          return { found: Boolean(data), code: data?.public_share_code ?? null };
-        },
-        createIfEmpty: async (candidate) => {
-          const { data, error } = await db.from("events")
-            .update({ public_share_code: candidate })
-            .eq("id", params.eventId).eq("user_id", user.id)
-            .is("public_share_code", null)
-            .select("public_share_code").maybeSingle();
-          if (error) throw error;
-          if (data) return { found: true, code: data.public_share_code, created: true };
-          const current = await store.read();
-          return { ...current, created: false };
-        },
-      };
-      try {
-        const result = await ensureShareCode(store);
-        if (result.status === "not-found") return status(404, { error: "Event tidak ditemukan." });
-        if (result.status === "unavailable") return status(409, { error: "Tautan belum siap. Coba lagi." });
-        return { enabled: true, token: result.code };
-      } catch {
-        return status(500, { error: "Gagal membaca status tautan publik." });
-      }
+      return existing.public_share_token
+        ? { enabled: true, token: existing.public_share_token }
+        : { enabled: false, token: null };
     },
     { params: EventId },
   )
   .post(
     "/:eventId/public-link",
     async ({ user, db, params, status }) => {
-      const store: ShareCodeStore = {
+      const store: ShareTokenStore = {
         read: async () => {
           const { data, error } = await db.from("events")
-            .select("public_share_token, public_share_code")
+            .select("public_share_token")
             .eq("id", params.eventId).eq("user_id", user.id).maybeSingle();
           if (error) throw error;
-          return { found: Boolean(data), code: data?.public_share_code ?? null };
+          return { found: Boolean(data), token: data?.public_share_token ?? null };
         },
         createIfEmpty: async (candidate) => {
           const { data, error } = await db.from("events")
-            .update({ public_share_code: candidate })
+            .update({ public_share_token: candidate })
             .eq("id", params.eventId).eq("user_id", user.id)
-            .is("public_share_code", null)
-            .select("public_share_code").maybeSingle();
+            .is("public_share_token", null)
+            .select("public_share_token").maybeSingle();
           if (error) throw error;
-          if (data) return { found: true, code: data.public_share_code, created: true };
+          if (data) return { found: true, token: data.public_share_token, created: true };
           return { ...(await store.read()), created: false };
         },
       };
 
       try {
-        const result = await ensureShareCode(store);
+        const result = await ensureShareToken(store);
         if (result.status === "not-found") {
           return status(404, { error: "Event tidak ditemukan." });
         }
         if (result.status === "unavailable") {
           return status(409, { error: "Tautan belum siap. Coba lagi." });
         }
-        return { enabled: true, token: result.code };
+        return { enabled: true, token: result.token };
       } catch {
         return status(500, { error: "Gagal membuat tautan publik." });
       }
@@ -251,7 +306,7 @@ export function createEventRoutes(authPlugin: typeof auth = auth) {
     async ({ user, db, params, status }) => {
       const { data, error } = await db
         .from("events")
-        .update({ public_share_token: null, public_share_code: null })
+        .update({ public_share_token: null })
         .eq("id", params.eventId)
         .eq("user_id", user.id)
         .select("id")
@@ -267,7 +322,7 @@ export function createEventRoutes(authPlugin: typeof auth = auth) {
     async ({ user, db, params, status }) => {
       const { data: event, error } = await db
         .from("events")
-        .select()
+        .select(EVENT_SELECT)
         .eq("id", params.eventId)
         .eq("user_id", user.id)
         .maybeSingle();
@@ -275,17 +330,17 @@ export function createEventRoutes(authPlugin: typeof auth = auth) {
       if (!event) return status(404, { error: "Event not found" });
 
       const [participants, transactions] = await Promise.all([
-        db.from("participants").select("id, name").eq("event_id", params.eventId).order("created_at"),
-        db.from("transactions").select().eq("event_id", params.eventId).order("transaction_at", { ascending: false }),
+        db.from("participants").select("id, name").eq("event_id", params.eventId).eq("user_id", user.id).order("created_at"),
+        db.from("transactions").select(TRANSACTION_SELECT).eq("event_id", params.eventId).eq("user_id", user.id).order("transaction_at", { ascending: false }),
       ]);
       if (participants.error || transactions.error) {
         return status(500, { error: (participants.error ?? transactions.error)!.message });
       }
 
       return {
-        event: toEvent(event as EventRow),
+        event: toEvent(await refreshEventReference(db, user.id, event as unknown as EventRow, fx)),
         participants: participants.data,
-        transactions: (transactions.data as TransactionRow[]).map(toTransaction),
+        transactions: (transactions.data as unknown as TransactionRow[]).map(toTransaction),
       };
     },
     { params: EventId },
@@ -293,50 +348,60 @@ export function createEventRoutes(authPlugin: typeof auth = auth) {
   .patch(
     "/:eventId",
     async ({ user, db, params, body, status }) => {
+      if (body.budget !== undefined) {
+        return status(400, { error: "Gunakan Penyesuaian Anggaran agar perubahan total tercatat di riwayat." });
+      }
       const patch: Record<string, unknown> = {};
       if (body.name !== undefined) patch.name = body.name.trim();
       if (body.eventDate !== undefined) patch.event_date = body.eventDate;
-      if (body.budget !== undefined) patch.budget = body.budget;
       if (body.status !== undefined) patch.status = body.status;
       if (body.notes !== undefined) patch.notes = body.notes;
 
-      if (body.budget !== undefined || body.cashBudget !== undefined) {
-        const { data: current, error: currentError } = await db
-          .from("events")
-          .select("budget, cash_budget")
-          .eq("id", params.eventId)
-          .eq("user_id", user.id)
-          .maybeSingle();
-        if (currentError) return status(500, { error: "Gagal memvalidasi pembagian anggaran." });
-        if (!current) return status(404, { error: "Event not found" });
+      // Inspect status before any currency validation or provider request.
+      const { data: currentStatus, error: statusError } = await db
+        .from("events").select(EVENT_SELECT)
+        .eq("id", params.eventId).eq("user_id", user.id).maybeSingle();
+      if (statusError) return status(500, { error: "Gagal memeriksa status event." });
+      if (!currentStatus) return status(404, { error: "Event not found" });
+      const currentEvent = currentStatus as unknown as EventRow;
+      const archiveConflict = getArchiveConflict(currentEvent.status);
+      if (archiveConflict) return status(409, { error: archiveConflict });
 
-        const result = resolveCashBudgetUpdate(
-          body.budget ?? Number(current.budget),
-          current.cash_budget === null ? null : Number(current.cash_budget),
-          body.cashBudget,
-        );
-        if (!result.ok) {
-          return status(400, { error: "Anggaran tunai harus di antara Rp0 dan total anggaran." });
+      const mode = body.currencyMode ?? currentEvent.currency_mode ?? "domestic";
+      const currency = body.baseCurrency ?? (mode === "domestic" ? "IDR" : currentEvent.base_currency ?? "IDR");
+      if (body.currencyMode !== undefined || body.baseCurrency !== undefined) {
+        const changed = currency !== (currentEvent.base_currency ?? "IDR") || mode !== (currentEvent.currency_mode ?? "domestic");
+        if (changed && currentEvent.currency_locked) return status(409, { error: "Mata uang terkunci setelah transaksi pertama." });
+        try {
+          await validateCurrency(mode, currency, fx);
+          normalizeMoney(currentEvent.budget, currency, { positive: true });
+          if (currentEvent.cash_budget !== null) normalizeMoney(currentEvent.cash_budget, currency);
+        } catch (error) { return status(400, { error: (error as Error).message }); }
+        patch.currency_mode = mode;
+        patch.base_currency = currency;
+        if (currency !== (currentEvent.base_currency ?? "IDR")) {
+          // Same nominal amount in the newly selected currency; the SQL guard owns this reset too.
+          patch.initial_budget = canonical(currentEvent.budget);
+          patch.initial_budget_known = true;
         }
-        if (body.cashBudget !== undefined || result.cashBudget !== current.cash_budget) {
-          patch.cash_budget = result.cashBudget;
+        if (changed) Object.assign(patch, referencePatch(await fx.snapshot(currency)));
+      }
+
+      if (body.cashBudget !== undefined) {
+        const current = currentEvent;
+        let cashBudget: string | null;
+        try { cashBudget = body.cashBudget === null ? null : normalizeMoney(body.cashBudget, currency); }
+        catch (error) { return status(400, { error: (error as Error).message }); }
+        if (current.cash_budget !== null && (cashBudget === null || compare(cashBudget, current.cash_budget) !== 0)) {
+          return status(400, { error: "Gunakan Realokasi Dana untuk mengubah pembagian tunai/digital." });
         }
+        if (cashBudget !== null && compare(cashBudget, current.budget) > 0) return status(400, { error: "Anggaran tunai melebihi total anggaran." });
+        patch.cash_budget = cashBudget;
       }
 
       if (Object.keys(patch).length === 0 && body.participants === undefined) {
         return status(400, { error: "No fields to update" });
       }
-
-      const { data: currentStatus, error: statusError } = await db
-        .from("events")
-        .select("status")
-        .eq("id", params.eventId)
-        .eq("user_id", user.id)
-        .maybeSingle();
-      if (statusError) return status(500, { error: "Gagal memeriksa status event." });
-      if (!currentStatus) return status(404, { error: "Event not found" });
-      const archiveConflict = getArchiveConflict(currentStatus.status);
-      if (archiveConflict) return status(409, { error: archiveConflict });
 
       patch.updated_at = new Date().toISOString();
 
@@ -345,11 +410,11 @@ export function createEventRoutes(authPlugin: typeof auth = auth) {
         .update(patch)
         .eq("id", params.eventId)
         .eq("user_id", user.id)
-        .select()
+        .select(EVENT_SELECT)
         .maybeSingle();
       if (error) {
         return status(isArchiveDbError(error) ? 409 : isClientError(error.code) ? 400 : 500, {
-          error: isArchiveDbError(error) ? ARCHIVED_EVENT_MUTATION_ERROR : error.message,
+          error: isArchiveDbError(error) ? (error.message === "Event currency is locked." ? "Mata uang terkunci setelah transaksi pertama." : ARCHIVED_EVENT_MUTATION_ERROR) : error.message,
         });
       }
       if (!data) return status(404, { error: "Event not found" });
@@ -373,7 +438,7 @@ export function createEventRoutes(authPlugin: typeof auth = auth) {
         }
       }
 
-      return toEvent(data as EventRow);
+      return toEvent(data as unknown as EventRow);
     },
     {
       params: EventId,
@@ -381,7 +446,9 @@ export function createEventRoutes(authPlugin: typeof auth = auth) {
         name: t.Optional(Name),
         eventDate: t.Optional(EventDate),
         budget: t.Optional(Budget),
-        cashBudget: t.Optional(t.Union([t.Integer({ minimum: 0 }), t.Null()])),
+        cashBudget: t.Optional(t.Union([MoneyInput, t.Null()])),
+        currencyMode: t.Optional(CurrencyMode),
+        baseCurrency: t.Optional(Currency),
         status: t.Optional(EditableStatus),
         notes: t.Optional(Notes),
         participants: t.Optional(t.Array(ParticipantName)),

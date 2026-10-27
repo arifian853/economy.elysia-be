@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
-const migration = readFileSync(new URL("../../supabase/migrations/005_event_archives.sql", import.meta.url), "utf8");
+const migration = readFileSync(new URL("../migrations/005_event_archives.sql", import.meta.url), "utf8");
 
 describe("event archive migration", () => {
   test("records a completion timestamp and backfills existing completed events", () => {

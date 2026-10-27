@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 const compactMigration = await Bun.file(
-  new URL("../../supabase/migrations/007_compact_public_share_codes.sql", import.meta.url),
+  new URL("../migrations/007_compact_public_share_codes.sql", import.meta.url),
 ).text();
 const compactFunction = compactMigration.split("as $function$")[1]?.split("$function$")[0]?.toLowerCase() ?? "";
 
@@ -17,7 +17,7 @@ describe("compact public share code migration", () => {
 });
 
 const migration = await Bun.file(
-  new URL("../../supabase/migrations/003_public_event_sharing.sql", import.meta.url),
+  new URL("../migrations/003_public_event_sharing.sql", import.meta.url),
 ).text();
 const functionBody = migration.split("as $function$")[1]?.split("$function$")[0]?.toLowerCase() ?? "";
 
