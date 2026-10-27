@@ -2,7 +2,7 @@ import { Elysia, t } from "elysia";
 import { auth } from "../auth";
 import { ensureShareToken, type ShareTokenStore } from "../share-token";
 import { ARCHIVED_EVENT_MUTATION_ERROR, getArchiveConflict } from "../event-archive";
-import { fxService, type FxService } from "../fx";
+import { fxService, validDate, type FxService } from "../fx";
 import { currencyFields, referencePatch, refreshEventReference, validateCurrency, type CurrencyRow } from "../event-currency";
 import { add, canonical, compare, EVENT_SELECT, moneyJson, MoneyInput, multiply, normalizeMoney, subtract, TRANSACTION_SELECT, type Money } from "../money";
 import { toTransaction, type TransactionRow } from "./transactions";
@@ -11,6 +11,7 @@ type EventRow = CurrencyRow & {
   id: string;
   name: string;
   event_date: string;
+  event_end_date: string;
   budget: Money;
   initial_budget: Money;
   initial_budget_known: boolean;
@@ -26,6 +27,7 @@ const toEvent = (r: EventRow) => ({
   id: r.id,
   name: r.name,
   eventDate: r.event_date,
+  eventEndDate: r.event_end_date,
   budget: moneyJson(r.budget),
   initialBudget: moneyJson(r.initial_budget),
   initialBudgetKnown: r.initial_budget_known,
@@ -43,6 +45,7 @@ const ParticipantName = t.String({ minLength: 1, maxLength: 100, pattern: "\\S" 
 const EditableStatus = t.Union([t.Literal("upcoming"), t.Literal("active")]);
 const Name = t.String({ minLength: 1, maxLength: 200, pattern: "\\S" }); // tidak boleh kosong/spasi saja
 const EventDate = t.String({ pattern: "^\\d{4}-\\d{2}-\\d{2}$" });
+const isEventDate = (value: string) => validDate(value);
 const Budget = MoneyInput;
 const CurrencyMode = t.Union([t.Literal("domestic"), t.Literal("international")]);
 const Currency = t.String({ pattern: "^[A-Z]{3}$" });
@@ -160,6 +163,8 @@ export function createEventRoutes(authPlugin: typeof auth = auth, fx: FxService 
   .post(
     "/",
     async ({ user, db, body, status }) => {
+      if (!isEventDate(body.eventDate) || (body.eventEndDate !== undefined && !isEventDate(body.eventEndDate))) return status(400, { error: "Tanggal event tidak valid." });
+      if ((body.eventEndDate ?? body.eventDate) < body.eventDate) return status(400, { error: "Tanggal akhir tidak boleh sebelum tanggal mulai." });
       const mode = body.currencyMode ?? "domestic", currency = body.baseCurrency ?? "IDR";
       let budget: string;
       try {
@@ -173,6 +178,7 @@ export function createEventRoutes(authPlugin: typeof auth = auth, fx: FxService 
           user_id: user.id,
           name: body.name.trim(),
           event_date: body.eventDate,
+          event_end_date: body.eventEndDate ?? body.eventDate,
           budget,
           initial_budget: budget,
           initial_budget_known: true,
@@ -206,6 +212,7 @@ export function createEventRoutes(authPlugin: typeof auth = auth, fx: FxService 
       body: t.Object({
         name: Name,
         eventDate: EventDate,
+        eventEndDate: t.Optional(EventDate),
         budget: Budget,
         currencyMode: t.Optional(CurrencyMode),
         baseCurrency: t.Optional(Currency),
@@ -353,7 +360,11 @@ export function createEventRoutes(authPlugin: typeof auth = auth, fx: FxService 
       }
       const patch: Record<string, unknown> = {};
       if (body.name !== undefined) patch.name = body.name.trim();
-      if (body.eventDate !== undefined) patch.event_date = body.eventDate;
+      const requestedStart = body.eventDate;
+      const requestedEnd = body.eventEndDate;
+      if ((requestedStart !== undefined && !isEventDate(requestedStart)) || (requestedEnd !== undefined && !isEventDate(requestedEnd))) {
+        return status(400, { error: "Tanggal event tidak valid." });
+      }
       if (body.status !== undefined) patch.status = body.status;
       if (body.notes !== undefined) patch.notes = body.notes;
 
@@ -366,6 +377,11 @@ export function createEventRoutes(authPlugin: typeof auth = auth, fx: FxService 
       const currentEvent = currentStatus as unknown as EventRow;
       const archiveConflict = getArchiveConflict(currentEvent.status);
       if (archiveConflict) return status(409, { error: archiveConflict });
+      const nextStart = requestedStart ?? currentEvent.event_date;
+      const nextEnd = requestedEnd ?? (requestedStart !== undefined && currentEvent.event_end_date === currentEvent.event_date ? requestedStart : currentEvent.event_end_date);
+      if (nextEnd < nextStart) return status(400, { error: "Tanggal akhir tidak boleh sebelum tanggal mulai." });
+      if (requestedStart !== undefined) patch.event_date = requestedStart;
+      if (requestedEnd !== undefined || (requestedStart !== undefined && currentEvent.event_end_date === currentEvent.event_date)) patch.event_end_date = nextEnd;
 
       const mode = body.currencyMode ?? currentEvent.currency_mode ?? "domestic";
       const currency = body.baseCurrency ?? (mode === "domestic" ? "IDR" : currentEvent.base_currency ?? "IDR");
@@ -445,6 +461,7 @@ export function createEventRoutes(authPlugin: typeof auth = auth, fx: FxService 
       body: t.Object({
         name: t.Optional(Name),
         eventDate: t.Optional(EventDate),
+        eventEndDate: t.Optional(EventDate),
         budget: t.Optional(Budget),
         cashBudget: t.Optional(t.Union([MoneyInput, t.Null()])),
         currencyMode: t.Optional(CurrencyMode),

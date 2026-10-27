@@ -3,8 +3,9 @@ import { validDate } from "./fx";
 
 type PublicFx = { fxRateToIdr: string | null; fxRateDate: string | null; fxRateProvider: string | null; idrEquivalent: Money | null };
 export type PublicEventView = {
-  event: { name: string; eventDate: string; initialBudget: Money; initialBudgetKnown: boolean; status?: string; updatedAt?: string; currencyMode?: string; baseCurrency?: string;
+  event: { name: string; eventDate: string; eventEndDate: string; initialBudget: Money; initialBudgetKnown: boolean; status?: string; updatedAt?: string; currencyMode?: string; baseCurrency?: string;
     fxReferenceRateToIdr?: string | null; fxReferenceDate?: string | null; fxReferenceProvider?: string | null };
+  participants: string[];
   budgetSummary: { budget: Money; cashBudget: Money | null; digitalBudget: Money | null; totalExpenses: Money; cashExpenses: Money;
     digitalExpenses: Money; totalRemaining: Money; cashRemaining: Money | null; digitalRemaining: Money | null };
   entries: Array<{ type: "expense"; name: string; amount: Money; source: "cash" | "digital"; transactionAt: string } & Partial<PublicFx>>;
@@ -35,6 +36,10 @@ export function sanitizePublicEvent(value: unknown): PublicEventView | null {
     const rawEvent = value.event;
     const { name, eventDate } = rawEvent;
     if (typeof name !== "string" || !name.trim() || typeof eventDate !== "string" || !validDate(eventDate)) return null;
+    const eventEndDate = rawEvent.eventEndDate ?? eventDate;
+    if (typeof eventEndDate !== "string" || !validDate(eventEndDate) || eventEndDate < eventDate) return null;
+    const participants = value.participants === undefined ? [] : value.participants;
+    if (!Array.isArray(participants) || participants.length > 100 || participants.some((n) => typeof n !== "string" || !n.trim() || n.trim().length > 100)) return null;
     // Old projections lack both fields. Their current budget is only an unknown placeholder.
     const missingInitial = rawEvent.initialBudget === undefined && rawEvent.initialBudgetKnown === undefined;
     const initial = missingInitial ? value.budgetSummary.budget : rawEvent.initialBudget;
@@ -42,7 +47,7 @@ export function sanitizePublicEvent(value: unknown): PublicEventView | null {
     const currency = rawEvent.baseCurrency ?? "IDR";
     if (typeof currency !== "string") return null;
     const digits = minorUnits(currency);
-    const event: PublicEventView["event"] = { name: name.trim(), eventDate,
+    const event: PublicEventView["event"] = { name: name.trim(), eventDate, eventEndDate,
       initialBudget: moneyJson(normalizeMoney(initial, currency, { positive: true })),
       initialBudgetKnown: missingInitial ? false : rawEvent.initialBudgetKnown as boolean };
     if (rawEvent.baseCurrency !== undefined) {
@@ -87,7 +92,7 @@ export function sanitizePublicEvent(value: unknown): PublicEventView | null {
     const entryCash = entries.filter((e) => e.source === "cash").reduce((sum, e) => add(sum, e.amount), "0");
     if (entryTotal !== totalExpenses || entryCash !== cashExpenses || subtract(entryTotal, entryCash) !== digitalExpenses) return null;
     const json = (v: string | null) => v === null ? null : moneyJson(v);
-    return { event, budgetSummary: { budget: moneyJson(budget), cashBudget: json(cashBudget), digitalBudget: json(digitalBudget),
+    return { event, participants: [...participants as string[]].map((n) => n.trim()).sort((a, b) => a < b ? -1 : a > b ? 1 : 0), budgetSummary: { budget: moneyJson(budget), cashBudget: json(cashBudget), digitalBudget: json(digitalBudget),
       totalExpenses: moneyJson(totalExpenses), cashExpenses: moneyJson(cashExpenses), digitalExpenses: moneyJson(digitalExpenses),
       totalRemaining: moneyJson(totalRemaining), cashRemaining: json(cashRemaining), digitalRemaining: json(digitalRemaining) }, entries };
   } catch { return null; }

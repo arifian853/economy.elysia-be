@@ -67,5 +67,5 @@ export function idrEquivalent(amount: Money, rate: Money | null): Money | null {
 }
 
 // PostgREST must serialize numeric columns as text before JSON parsing can lose precision.
-export const EVENT_SELECT = "id,name,event_date,budget::text,initial_budget::text,initial_budget_known,cash_budget::text,status,notes,created_at,updated_at,completed_at,currency_mode,base_currency,currency_locked,fx_reference_rate_to_idr::text,fx_reference_date,fx_reference_provider";
+export const EVENT_SELECT = "id,name,event_date,event_end_date,budget::text,initial_budget::text,initial_budget_known,cash_budget::text,status,notes,created_at,updated_at,completed_at,currency_mode,base_currency,currency_locked,fx_reference_rate_to_idr::text,fx_reference_date,fx_reference_provider";
 export const TRANSACTION_SELECT = "id,event_id,name,quantity,unit_price::text,payment_method,note,transaction_at,created_at,updated_at,base_currency,fx_rate_to_idr::text,fx_rate_date,fx_rate_provider";

@@ -22,10 +22,33 @@ const PRIVATE_DATA = {
     { type: "expense", name: "Belanja QRIS", amount: 35_000, source: "digital", transactionAt: "2026-11-03T11:00:00.000Z", paymentMethod: "qris", note: "internal" },
     { type: "income", name: "Income not modeled", amount: 100_000, source: "digital", transactionAt: "2026-11-03T12:00:00.000Z" },
   ],
-  participants: [{ name: "Jangan tampilkan" }],
+  participants: [],
 };
 
 describe("public event route", () => {
+  test("publishes only trimmed participant display names and date range", async () => {
+    const data = {
+      ...PRIVATE_DATA,
+      event: { ...PRIVATE_DATA.event, eventEndDate: "2026-11-05" },
+      participants: [" Nadia ", "Fian"], participantMetadata: [{ id: "private-id", user_id: "private-user", email: "private@example.test" }],
+    };
+    const app = new Elysia().use(createPublicEventRoutes(async () => ({ data, error: null })));
+    const response = await app.handle(new Request("http://localhost/public/events", { headers: { "x-economy-share-token": SHARE_TOKEN } }));
+    const body = await response.json() as Record<string, any>;
+    expect(response.status).toBe(200);
+    expect(body.event.eventEndDate).toBe("2026-11-05");
+    expect(body.participants).toEqual(["Fian", "Nadia"]);
+    expect(JSON.stringify(body)).not.toMatch(/private-id|private-user|private@example|notes|email|user_id/);
+  });
+
+  test("rejects impossible dates and reversed date ranges", async () => {
+    for (const [eventDate, eventEndDate] of [["2026-02-31", "2026-03-01"], ["2026-11-05", "2026-11-03"]]) {
+      const data = { ...PRIVATE_DATA, event: { ...PRIVATE_DATA.event, eventDate, eventEndDate } };
+      const app = new Elysia().use(createPublicEventRoutes(async () => ({ data, error: null })));
+      const response = await app.handle(new Request("http://localhost/public/events", { headers: { "x-economy-share-token": SHARE_TOKEN } }));
+      expect(response.status).toBe(404);
+    }
+  });
   test("serves the financial summary and allowlisted entries without requiring login", async () => {
     let receivedToken = "";
     const app = new Elysia().use(
@@ -44,7 +67,8 @@ describe("public event route", () => {
     expect(response.status).toBe(200);
     expect(receivedToken).toBe(SHARE_TOKEN);
     expect(await response.json()).toEqual({
-      event: { name: "Camping Bintan", eventDate: "2026-11-03", initialBudget: 100_000, initialBudgetKnown: false },
+      event: { name: "Camping Bintan", eventDate: "2026-11-03", eventEndDate: "2026-11-03", initialBudget: 100_000, initialBudgetKnown: false },
+      participants: [],
       budgetSummary: {
         budget: 100_000,
         cashBudget: 25_000,
